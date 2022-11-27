@@ -7,7 +7,7 @@ from utils.arg_parser import parse_input_args
 def infer(task_id):
 
   with open("config.yml", 'r') as ymlfile:
-    cfg = yaml.load(ymlfile)
+    cfg = yaml.load(ymlfile, Loader=yaml.Loader)
 
   checkpoint_path = cfg['checkpoint_path']
   test_path = cfg['test_path']
@@ -15,7 +15,7 @@ def infer(task_id):
 
 
   vocabulary = vocabulary_extractor.load_vocabulary(token_path)
-  m = Model(mode='infer', task_id=task_id, vocabulary=vocabulary)
+  m = Model(mode='infer', task_id=task_id, vocabulary=vocabulary, checkpoint_path=checkpoint_path)
 
   m.infer(corpus_path=test_path, checkpoint_path=checkpoint_path)
   print("Inference ran successfully...")
@@ -25,5 +25,6 @@ def infer(task_id):
 args = sys.argv[1:]
 task_id = parse_input_args(args)
 
+print(task_id)
 infer(task_id)
 

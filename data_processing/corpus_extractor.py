@@ -2,13 +2,13 @@ import os
 import yaml
 from random import shuffle
 from shutil import copyfile
-
+import random
 
 
 def split_samples():
 
     with open("config.yml", 'r') as ymlfile:
-        cfg = yaml.load(ymlfile)
+        cfg = yaml.load(ymlfile, Loader=yaml.Loader)
 
     corpus_path = cfg['corpus_path']
     train_path  = cfg['train_path']
@@ -23,6 +23,7 @@ def split_samples():
 
     # Extract all filenames from corpus folders
     for dirpath, dirs, files in os.walk(corpus_path):
+        files = random.sample(files, 10000)
         for filename in files:
             if filename.endswith('proto') and not filename.endswith(ignore):
 

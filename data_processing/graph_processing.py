@@ -222,10 +222,7 @@ def get_method_body_samples(graph, node_seq_length, pad_token, slot_token, vocab
 
 
         sym_mth_parents = [node_id for node_id in predecessor_ids if node_table[node_id].type == FeatureNode.SYMBOL_MTH]
-
-
         if len(sym_mth_parents) > 0:
-
             usage_node_ids = [node_id for sym_mth_parent in sym_mth_parents
                               for node_id in successor_table[sym_mth_parent]
                               if node_table[node_id].type == FeatureNode.IDENTIFIER_TOKEN]

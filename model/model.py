@@ -1,6 +1,7 @@
-import tensorflow as tf
 from graph_pb2 import Graph
-from dpu_utils.tfmodels import SparseGGNN
+from model.sparse_ggnn import SparseGGNN
+from model.rgat import sparse_rgat_layer
+from model.rgcn import sparse_rgcn_layer
 from data_processing.sample_inf_processing import SampleMetaInformation, CorpusMetaInformation
 import numpy as np
 import os
@@ -8,11 +9,19 @@ from data_processing import graph_processing
 from data_processing.graph_features import get_used_edges_type
 from random import shuffle
 from utils.utils import compute_f1_score
+import yaml
+import pickle
 
+
+import tensorflow_addons as tfa
+
+import tensorflow as tf2
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
 
 class Model:
 
-    def __init__(self, mode, task_id, vocabulary):
+    def __init__(self, mode, task_id, vocabulary, checkpoint_path):
 
         # Initialize parameter values
         self.max_node_seq_len = 32                          # Maximum number of node subtokens
@@ -30,6 +39,9 @@ class Model:
         self.embedding_size = self.ggnn_params['hidden_size']
         self.ggnn_dropout = 1.0
         self.task_type = task_id
+        self.use_existing = False
+        self.checkpoint_path = checkpoint_path
+        self.model_name = "sparse_rgcn" # Choose between sparse_ggnn, sparse_rgat, sparse_rgcn
 
         if mode != 'train' and mode != 'infer':
             raise ValueError("Invalid mode. Please specify \'train\' or \'infer\'...")
@@ -38,15 +50,20 @@ class Model:
         self.graph = tf.Graph()
         self.mode = mode
 
+        config = tf.ConfigProto()
+        config.gpu_options.allow_growth = True
+        print('############## Allowing Growth ###########')
+
         with self.graph.as_default():
 
             self.placeholders = {}
             self.make_model()
-            self.sess = tf.Session(graph=self.graph, config=tf.ConfigProto())
+            self.sess = tf.Session(graph=self.graph, config=config)
 
             if self.mode == 'train':
                 self.make_train_step()
                 self.sess.run(tf.global_variables_initializer())
+
 
 
         print ("Model built successfully...")
@@ -132,13 +149,23 @@ class Model:
         self.get_initial_node_representation()
 
         # Run graph through GGNN layer
-        self.gnn_model = SparseGGNN(self.ggnn_params)
-        self.gnn_representation = self.gnn_model.sparse_gnn_layer(self.ggnn_dropout,
+        if self.model_name == "sparse_ggnn":
+            self.gnn_model = SparseGGNN(self.ggnn_params)
+            self.gnn_representation = self.gnn_model.sparse_gnn_layer(self.ggnn_dropout,
                                                         self.node_label_representations,
                                                         self.placeholders['adjacency_lists'],
                                                         self.placeholders['num_incoming_edges_per_type'],
                                                         self.placeholders['num_outgoing_edges_per_type'],
                                                         {})
+        elif self.model_name == "sparse_rgat":
+            self.gnn_representation = sparse_rgat_layer(self.node_label_representations,
+                                                        self.placeholders['adjacency_lists'],
+                                                        self.node_label_representations.shape.as_list()[1])
+        elif self.model_name == "sparse_rgcn":
+            self.gnn_representation = sparse_rgcn_layer(self.node_label_representations,
+                                                        self.placeholders['adjacency_lists'],
+                                                        self.placeholders['num_incoming_edges_per_type'],
+                                                        self.node_label_representations.shape.as_list()[1])
 
 
         # Compute average of <SLOT> usage representations
@@ -161,15 +188,17 @@ class Model:
         # Training
         decoder_embedding_inputs = tf.nn.embedding_lookup(self.embedding_decoder, self.placeholders['decoder_inputs'])
 
-        self.train_helper = tf.contrib.seq2seq.TrainingHelper(decoder_embedding_inputs,
-                                        self.placeholders['decoder_targets_length'],
-                                        time_major=True)
+        self.train_sampler = tfa.seq2seq.TrainingSampler(time_major=True)
+        self.train_sampler.initialize(decoder_embedding_inputs,
+                                        self.placeholders['decoder_targets_length'])
 
-        self.train_decoder = tf.contrib.seq2seq.BasicDecoder(self.decoder_cell, self.train_helper,
-                                                             initial_state=decoder_initial_state,
+        self.train_decoder = tfa.seq2seq.BasicDecoder(self.decoder_cell, self.train_sampler,
                                                              output_layer=self.projection_layer)
 
-        decoder_outputs_train, _, _ = tf.contrib.seq2seq.dynamic_decode(self.train_decoder)
+        decoder_outputs_train, _, _ = tfa.seq2seq.dynamic_decode(self.train_decoder,
+                                                                    decoder_init_input=decoder_embedding_inputs,
+                                                                    decoder_init_kwargs={
+                                                                    "initial_state": decoder_initial_state})
 
         self.decoder_logits_train = decoder_outputs_train.rnn_output
 
@@ -178,17 +207,18 @@ class Model:
         end_token = self.pad_token_id
         max_iterations = self.max_var_seq_len
 
-        self.inference_helper = tf.contrib.seq2seq.GreedyEmbeddingHelper(self.embedding_decoder,
-                                                                         start_tokens=self.placeholders['sos_tokens'],
-                                                                         end_token=end_token)
+        self.inference_sampler = tfa.seq2seq.GreedyEmbeddingSampler()
 
-
-        self.inference_decoder = tf.contrib.seq2seq.BasicDecoder(self.decoder_cell, self.inference_helper,
-                                                                 initial_state=decoder_initial_state,
+        self.inference_decoder = tfa.seq2seq.BasicDecoder(self.decoder_cell, self.inference_sampler,
                                                                  output_layer=self.projection_layer)
 
-        outputs_inference, _, _ = tf.contrib.seq2seq.dynamic_decode(self.inference_decoder,
-                                                                    maximum_iterations=max_iterations)
+        outputs_inference, _, _ = tfa.seq2seq.dynamic_decode(self.inference_decoder,
+                                                                    maximum_iterations=max_iterations,
+                                                                    decoder_init_input=self.embedding_decoder,
+                                                                    decoder_init_kwargs={
+                                                                    "initial_state": decoder_initial_state,
+                                                                    "start_tokens":self.placeholders['sos_tokens'],
+                                                                    "end_token":end_token})
 
         self.predictions = outputs_inference.sample_id
 
@@ -199,10 +229,10 @@ class Model:
 
         max_batch_seq_len = tf.reduce_max(self.placeholders['decoder_targets_length'])
 
-        self.crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.placeholders['decoder_targets'][:, :max_batch_seq_len],
+        self.crossent = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.placeholders['decoder_targets'],
                                                                        logits=self.decoder_logits_train)
 
-        self.train_loss = tf.reduce_sum(self.crossent * self.placeholders['target_mask'][:, :max_batch_seq_len]) / self.placeholders['num_samples_in_batch']
+        self.train_loss = tf.reduce_sum(self.crossent * self.placeholders['target_mask']) / self.placeholders['num_samples_in_batch']
 
         # Calculate and clip gradients
         self.train_vars = tf.trainable_variables()
@@ -357,9 +387,10 @@ class Model:
         batch_samples, labels = [], []
         current_batch = []
         nodes_in_curr_batch = 0
+        length = len(graph_samples)
 
         for sample_index, graph_sample in enumerate(graph_samples):
-
+            print(f"Processing {sample_index} out of {length}...")
             num_nodes_in_sample = graph_sample[self.placeholders['node_label_indices']].shape[0]
 
             # Skip sample if it is too big
@@ -383,13 +414,15 @@ class Model:
         if len(current_batch) > 0:
             batch_samples.append(self.make_batch(current_batch))
 
+        print("Done making batch samples...")
+
         return batch_samples, labels
 
 
 
     # Merge set of given graph samples into a single batch
     def make_batch(self, graph_samples):
-
+        print("Making batch...")
         node_offset = 0
         node_reps = []
         slot_ids, slot_masks = [], []
@@ -457,22 +490,12 @@ class Model:
 
             batch_sample[self.placeholders['adjacency_lists'][i]] = adj_list
 
+        print("Batch finished!")
         return batch_sample
 
 
-
-
-    def get_samples(self, dir_path):
-
-        graph_samples, labels, _ = self.get_samples_with_metainf(dir_path)
-
-        return graph_samples, labels
-
-
-
-    def get_samples_with_metainf(self, dir_path):
-
-        graph_samples, labels, metainf = [], [], []
+    def get_samples_with_metainf(self, dir_path, train=True):
+        graph_samples, labels, meta_inf = [], [], []
 
         n_files = sum([1 for dirpath, dirs, files in os.walk(dir_path) for filename in files if filename.endswith('proto')])
         n_processed = 0
@@ -488,35 +511,41 @@ class Model:
                     if len(new_samples) > 0:
                         graph_samples += new_samples
                         labels += new_labels
-                        metainf += new_inf
-
+                        meta_inf += new_inf
                     n_processed += 1
                     print("Processed ", n_processed/n_files * 100, "% of files...")
 
-
-        zipped = list(zip(graph_samples, labels, metainf))
+        zipped = list(zip(graph_samples, labels, meta_inf))
         shuffle(zipped)
-        graph_samples, labels, metainf = zip(*zipped)
+        graph_samples, labels, meta_inf = zip(*zipped)
 
         if self.enable_batching:
             graph_samples, labels = self.make_batch_samples(graph_samples, labels)
 
-        return graph_samples, labels, metainf
+        print("Done making samples!")
+        return graph_samples, labels, meta_inf
 
 
 
-    def train(self, train_path, val_path, n_epochs, checkpoint_path):
-
-        train_samples, train_labels = self.get_samples(train_path)
+    def train(self, train_path, val_path, n_epochs):
+        train_samples, train_labels, _ = self.get_samples_with_metainf(train_path)
         print("Extracted training samples... ", len(train_samples))
-
-        val_samples, val_labels, meta_inf = self.get_samples_with_metainf(val_path)
+        val_samples, val_labels, meta_inf = self.get_samples_with_metainf(val_path, train=False)
         print("Extracted validation samples... ", len(val_samples))
-
+        start_epoch = 0
 
         with self.graph.as_default():
+            saver = tf.train.Saver()
+            checkpoint_list = [path for path in os.listdir(self.checkpoint_path) if "cpkt" in path]
+            if checkpoint_list:
+                print("Model exists!")
+                start_epoch = sorted(checkpoint_list)[-1].split("-")[0] 
+                checkpoint_path = os.path.join(self.checkpoint_path, f"{start_epoch}-train.cpkt")
+                print(f"Model at epoch {start_epoch} loaded successfully...")
+                saver.restore(self.sess, checkpoint_path)
+                start_epoch = int(start_epoch) + 1
 
-            for epoch in range(n_epochs):
+            for epoch in range(start_epoch, n_epochs):
 
                 loss = 0
 
@@ -529,14 +558,14 @@ class Model:
 
 
                 if (epoch+1) % 5 == 0:
-
                     saver = tf.train.Saver()
+                    checkpoint_path = os.path.join(self.checkpoint_path, f"{epoch}-train.cpkt")
+                    print(f"Saving model at epoch {epoch + 1} at {checkpoint_path}...")
                     saver.save(self.sess, checkpoint_path)
 
                     self.compute_metrics_from_graph_samples(val_samples, val_labels, meta_inf)
 
-            saver = tf.train.Saver()
-            saver.save(self.sess, checkpoint_path)
+            saver.save(self.sess, self.checkpoint_path)
 
 
 
@@ -553,8 +582,12 @@ class Model:
         with self.graph.as_default():
 
             saver = tf.train.Saver()
+            checkpoint_list = [path for path in os.listdir(self.checkpoint_path) if "cpkt" in path]
+            start_epoch = sorted(checkpoint_list)[-1].split("-")[0]
+            print(checkpoint_list)
+            checkpoint_path = os.path.join(self.checkpoint_path, f"{start_epoch}-train.cpkt")
             saver.restore(self.sess, checkpoint_path)
-            print("Model loaded successfully...")
+            print(f"Model at epoch {start_epoch} loaded successfully...")
 
             _, _, predicted_names = self.compute_metrics_from_graph_samples(test_samples, test_labels, meta_inf)
 
